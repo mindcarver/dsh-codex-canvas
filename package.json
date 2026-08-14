@@ -9,17 +9,18 @@
     "build": "tsdown",
     "prepare": "tsdown"
   },
-  "dependencies": {
+  "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-jobs": "^0.0.1-rc.3",
     "@deepseek-ai/dsh-subprocess": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
-  },
-  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^24.0.0",
     "tsdown": "^0.14.0",
     "typescript": "^5.9.3"
+  },
+  "comments": {
+    "runtime-deps": "Deliberately none: @deepseek-ai/* resolve at runtime through the profile parent-walk to the dsh installation fallback (~/.dsh/profiles/node_modules), which is healed to the SAME dsh version as the running CLI. Bundling npm copies here would mix an old dsh-tools/dsh-jobs runtime with the new registry and break (observed: 'Cannot read properties of undefined (reading prepare)')."
   },
   "dsh": {
     "bundle": {

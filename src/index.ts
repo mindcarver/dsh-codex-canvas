@@ -16,7 +16,8 @@ import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-sub
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
-import { mkdir, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 declare module '@deepseek-ai/dsh-jobs' {
@@ -36,6 +37,8 @@ export interface Config {
   timeoutMs: number
   /** Terminate-escalation grace for the spawned process tree, milliseconds. */
   graceMs: number
+  /** Extra environment entries for the codex child (e.g. HTTPS_PROXY=http://127.0.0.1:10809). */
+  env: Record<string, string>
 }
 
 /** Runtime configuration schema for the codex-canvas plugin. */
@@ -43,6 +46,7 @@ export const Config: z<Config> = z.object({
   codexBinary: z.string().default('codex'),
   timeoutMs: z.number().default(300_000),
   graceMs: z.number().default(5_000),
+  env: z.object({}).default({}),
 })
 
 const description = 'Generate an image with gpt-image-2 through the Codex CLI. '
@@ -109,11 +113,56 @@ function spawnCodex(ctx: Context, config: Config, request: string, cwd: string, 
     },
     graceMs: config.graceMs,
     signal,
+    // Explicit opt-in entries (e.g. HTTPS_PROXY) survive the seam's credential scrub;
+    // undefined-valued keys are dropped so they never tombstone ambient entries.
+    env: Object.fromEntries(Object.entries(config.env).filter(([, v]) => v !== undefined)),
   } satisfies SubprocessSpawnSpec)
 }
 
+/**
+ * Codex's image-generation tool frequently IGNORES the requested save path and
+ * drops the PNG into its own default directory `~/.codex/generated_images/`
+ * under a uuid name. When the requested path is missing after a clean exit,
+ * recover the freshest image this run produced (mtime after `startedAt`) and
+ * move it to the requested path.
+ */
+async function recoverFromCodexImagesDir(outputPath: string, startedAt: number): Promise<boolean> {
+  const root = join(homedir(), '.codex', 'generated_images')
+  // codex nests images one level down: generated_images/<session-uuid>/<exec-uuid>.png
+  let sessionDirs: string[]
+  try {
+    sessionDirs = await readdir(root)
+  } catch {
+    return false
+  }
+  let newest: { path: string; mtime: number } | undefined
+  for (const session of sessionDirs) {
+    const sessionDir = join(root, session)
+    let files: string[]
+    try {
+      files = await readdir(sessionDir)
+    } catch {
+      continue
+    }
+    for (const name of files) {
+      if (!name.toLowerCase().endsWith('.png')) continue
+      const p = join(sessionDir, name)
+      try {
+        const info = await stat(p)
+        // Only images created during THIS codex run (clock skew tolerance 5s).
+        if (info.mtimeMs < startedAt - 5_000) continue
+        if (newest === undefined || info.mtimeMs > newest.mtime) newest = { path: p, mtime: info.mtimeMs }
+      } catch { /* raced away */ }
+    }
+  }
+  if (newest === undefined) return false
+  await mkdir(dirname(outputPath), { recursive: true })
+  await copyFile(newest.path, outputPath)
+  return true
+}
+
 /** Map a settled codex process to a job outcome; reads retained stderr tail. */
-async function settleOutcome(handle: SubprocessHandle, outputPath: string): Promise<JobOutcome> {
+async function settleOutcome(handle: SubprocessHandle, outputPath: string, startedAt: number): Promise<JobOutcome> {
   let outcome: Awaited<SubprocessHandle['done']>
   try {
     outcome = await handle.done
@@ -125,7 +174,12 @@ async function settleOutcome(handle: SubprocessHandle, outputPath: string): Prom
       const info = await stat(outputPath)
       return { status: 'completed', output: `image written to ${outputPath} (${info.size} bytes)` }
     } catch {
-      return { status: 'failed', detail: 'codex exited 0 but the image file is missing', output: `expected ${outputPath}` }
+      if (await recoverFromCodexImagesDir(outputPath, startedAt)) {
+        const info = await stat(outputPath)
+        return { status: 'completed', output: `image written to ${outputPath} (${info.size} bytes, recovered from codex generated_images)` }
+      }
+      const stdout = handle.collected.stdout?.readFrom(0)?.text ?? ''
+      return { status: 'failed', detail: 'codex exited 0 but produced no image (network/login issue?)', output: `expected ${outputPath}; codex said: ${stdout.trim().slice(-500) || '(no output)'}` }
     }
   }
   const stderr = handle.collected.stderr?.readFrom(0)?.text ?? ''
@@ -223,8 +277,9 @@ export function apply(ctx: Context, config: Config): void {
         exec.signal.addEventListener('abort', onCallAbort, { once: true })
         let handle: SubprocessHandle
         try {
+          const startedAt = Date.now()
           handle = spawnCodex(ctx, cfg, request, cwd, controller.signal)
-          const outcome = await settleOutcome(handle, outputPath)
+          const outcome = await settleOutcome(handle, outputPath, startedAt)
           if (outcome.status === 'completed') {
             const bytes = await stat(outputPath).then((info: { size: number }) => info.size, () => 0)
             const ok: ImageGenResult = { kind: 'foreground', status: 'ok', path: outputPath, bytes }
@@ -248,8 +303,9 @@ export function apply(ctx: Context, config: Config): void {
         label: `image_gen → ${args.file_name}`,
         ...exec.agent !== undefined ? { owner: exec.agent } : {},
         run() {
+          const startedAt = Date.now()
           handle = spawnCodex(ctx, cfg, request, cwd, controller.signal)
-          const done = settleOutcome(handle, outputPath)
+          const done = settleOutcome(handle, outputPath, startedAt)
           return {
             cancel(reason: string | undefined) {
               controller.abort()

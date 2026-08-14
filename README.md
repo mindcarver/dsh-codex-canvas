@@ -82,6 +82,8 @@ Override the plugin row (`id: codex-canvas`) in the profile's `cordis.patch.yml`
     codexBinary: codex      # executable (PATH name or absolute path)
     timeoutMs: 300000       # foreground generation budget
     graceMs: 5000           # process-tree terminate grace
+    env:                    # extra env for the codex child, e.g. proxy
+      HTTPS_PROXY: http://127.0.0.1:10809
 ```
 
 ## Troubleshooting
@@ -90,7 +92,9 @@ Override the plugin row (`id: codex-canvas`) in the profile's `cordis.patch.yml`
 | --- | --- |
 | `codex` not found | `npm i -g @openai/codex`, check `codex --version` |
 | Not logged in | `codex login` |
-| Image lands in wrong place | The plugin always passes `-C <session workspace>`; check the job output for the actual path |
+| Network can't reach OpenAI | Set a proxy via the `env` config (see Configuration) |
+| `failed to spawn code-mode-host` / `the local tool host is missing` | Windows: copy `codex-code-mode-host.exe` (and `codex-windows-sandbox-setup.exe`) from `node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/*/bin/` into the npm bin dir next to `codex.exe`. Git Bash works without this (the sh wrapper resolves vendor paths), but spawned processes hit raw `codex.exe` |
+| Image lands in wrong place | When codex ignores the requested path and drops the PNG into `~/.codex/generated_images/<uuid>/<uuid>.png`, the plugin recovers the freshest image of THIS run and copies it to `<workspace>/images/<file_name>` automatically |
 | Generation takes > 5 min and gets killed | Raise `timeoutMs` |
 
 ## Development
