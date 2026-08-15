@@ -1,30 +1,62 @@
 {
   "name": "dsh-codex-canvas",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness tool plugin: image generation (gpt-image-2) via the Codex CLI",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness tool plugin: image generation (gpt-image-2) via the Codex CLI, with inline Web preview",
   "type": "module",
   "main": "lib/index.js",
-  "files": ["lib", "cordis.patch.yml"],
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
   "scripts": {
     "build": "tsdown",
-    "prepare": "tsdown"
+    "prepare": "tsdown",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-locale": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-jobs": "^0.0.1-rc.3",
+    "@deepseek-ai/dsh-session": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-session-persistence": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-subprocess": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^24.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.7",
+    "react": "^18.3.0",
     "tsdown": "^0.14.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   },
   "comments": {
-    "runtime-deps": "Deliberately none: @deepseek-ai/* resolve at runtime through the profile parent-walk to the dsh installation fallback (~/.dsh/profiles/node_modules), which is healed to the SAME dsh version as the running CLI. Bundling npm copies here would mix an old dsh-tools/dsh-jobs runtime with the new registry and break (observed: 'Cannot read properties of undefined (reading prepare)')."
+    "runtime-deps": "Deliberately none: @deepseek-ai/* resolve at runtime through the profile parent-walk to the dsh installation fallback (~/.dsh/profiles/node_modules), which is healed to the SAME dsh version as the running CLI. Bundling npm copies here would mix an old dsh-tools/dsh-jobs runtime with the new registry and break (observed: 'Cannot read properties of undefined (reading prepare)').",
+    "typecheck": "The @deepseek-ai devDependencies are compile-time only. dsh-client-ui-tool, dsh-client-connection, and dsh-client-runtime pull unpublished dependency closures from npm, so types/ holds minimal structural shims for the slices this plugin consumes; everything else typechecks against the published packages.",
+    "client-half": "dsh.client declares the browser bundle; the harness client-module system serves exports[\"./client\"] at /plugins/dsh-codex-canvas/client.js and executes it through window.__ModuleLoader__. The same cordis.patch.yml row activates both halves."
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
   }
 }
