@@ -12,6 +12,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -19,6 +20,9 @@ import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import { copyFile, mkdir, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { DEFAULT_MAX_IMAGE_BYTES } from './artifact.ts'
+import { createArtifactRpcHandler, RPC_CHANNEL, type ArtifactJobRegistryLike, type ArtifactJobState } from './rpc.ts'
+import { artifactMetaFromValue, type MetaValue } from './shared/meta.ts'
 
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap {
@@ -39,6 +43,8 @@ export interface Config {
   graceMs: number
   /** Extra environment entries for the codex child (e.g. HTTPS_PROXY=http://127.0.0.1:10809). */
   env: Record<string, string>
+  /** Size cap for one image served through the preview RPC, bytes. */
+  maxImageBytes: number
 }
 
 /** Runtime configuration schema for the codex-canvas plugin. */
@@ -47,6 +53,7 @@ export const Config: z<Config> = z.object({
   timeoutMs: z.number().default(300_000),
   graceMs: z.number().default(5_000),
   env: z.object({}).default({}),
+  maxImageBytes: z.number().default(DEFAULT_MAX_IMAGE_BYTES),
 })
 
 const description = 'Generate an image with gpt-image-2 through the Codex CLI. '
@@ -161,9 +168,15 @@ async function recoverFromCodexImagesDir(outputPath: string, startedAt: number):
   return true
 }
 
+/** Project one settled job outcome into preview-registry memory. */
+function jobStateOf(outcome: JobOutcome): ArtifactJobState {
+  if (outcome.status === 'completed') return { status: 'completed' }
+  if (outcome.status === 'killed') return { status: 'killed' }
+  return { status: 'failed', detail: outcome.detail ?? 'generation failed' }
+}
+
 /** Map a settled codex process to a job outcome; reads retained stderr tail. */
-async function settleOutcome(handle: SubprocessHandle, outputPath: string, startedAt: number): Promise<JobOutcome> {
-  let outcome: Awaited<SubprocessHandle['done']>
+async function settleOutcome(handle: SubprocessHandle, outputPath: string, startedAt: number): Promise<JobOutcome> {  let outcome: Awaited<SubprocessHandle['done']>
   try {
     outcome = await handle.done
   } catch (error: unknown) {
@@ -193,6 +206,26 @@ async function settleOutcome(handle: SubprocessHandle, outputPath: string, start
 export function apply(ctx: Context, config: Config): void {
   const cfg: Config = { ...Config, ...config }
 
+  // In-process memory of background generations: the preview RPC consults it
+  // to tell "still generating" from "failed/killed" before the file exists.
+  const jobStates = new Map<string, ArtifactJobState>()
+  const registry: ArtifactJobRegistryLike = { get: jobId => jobStates.get(jobId) }
+
+  // Web preview RPC: activates only in compositions that expose the
+  // connection/sessions services (the web profile); CLI/headless keeps the
+  // text-only behavior with no channel registered.
+  ctx.inject(['connection', 'sessions', 'sessionPersistence'], rpcCtx => {
+    void rpcCtx.connection.rpc.handle(
+      RPC_CHANNEL,
+      createArtifactRpcHandler({
+        services: { sessions: rpcCtx.sessions, sessionPersistence: rpcCtx.sessionPersistence },
+        registry,
+        maxImageBytes: cfg.maxImageBytes,
+      }) as unknown as ConnectionRpcHandler,
+      { authority: 'trusted-host' },
+    )
+  })
+
   ctx.tools.register(defineTool({
     name: 'image_gen',
     description,
@@ -219,8 +252,7 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           result: {
             required: true,
-            oneOf: [
-              {
+            oneOf: [              {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
@@ -251,6 +283,8 @@ export function apply(ctx: Context, config: Config): void {
             ? `image written to ${value.result.path} (${value.result.bytes} bytes)`
             : `image generation failed: ${value.result.message}`,
       }],
+      presentationMeta: (args: ImageGenArgs, value: { result: ImageGenResult }) =>
+        artifactMetaFromValue(args, value.result as MetaValue),
     },
     presentCall(args: ImageGenArgs) {
       return {
@@ -306,8 +340,17 @@ export function apply(ctx: Context, config: Config): void {
           const startedAt = Date.now()
           handle = spawnCodex(ctx, cfg, request, cwd, controller.signal)
           const done = settleOutcome(handle, outputPath, startedAt)
+          void done.then(outcome => {
+            // A cancel records `killed` synchronously; the settled outcome of a
+            // killed tree ("exit 0, no image") must not overwrite that fact.
+            if (jobStates.get(jobId)?.status === 'killed') return
+            jobStates.set(jobId, jobStateOf(outcome))
+          }, (error: unknown) => {
+            jobStates.set(jobId, { status: 'failed', detail: `codex launch failed: ${String(error)}` })
+          })
           return {
             cancel(reason: string | undefined) {
+              jobStates.set(jobId, { status: 'killed' })
               controller.abort()
               handle?.terminate()
               void reason
@@ -316,6 +359,7 @@ export function apply(ctx: Context, config: Config): void {
           }
         },
       })
+      jobStates.set(jobId, { status: 'running' })
       const started: ImageGenResult = { kind: 'background', jobId }
       return { result: started }
     },

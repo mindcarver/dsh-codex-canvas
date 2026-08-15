@@ -4,7 +4,7 @@
 
 <a id="english"></a>
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that gives the agent an `image_gen` tool backed by the **Codex CLI** (gpt-image-2). Say "draw me a shiba in sunglasses" in the Web UI and the harness spawns `codex exec` to generate the image — no OpenAI API key needed, a logged-in ChatGPT account is enough.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that gives the agent an `image_gen` tool backed by the **Codex CLI** (gpt-image-2). Say "draw me a shiba in sunglasses" in the Web UI and the harness spawns `codex exec` to generate the image — no OpenAI API key needed, a logged-in ChatGPT account is enough. Finished images render **inline in the Web tool card**; the model-visible history stays plain text.
 
 ## How it works
 
@@ -14,11 +14,15 @@ agent ──▶ image_gen(prompt, file_name)          (model-facing tool)
               ├── ctx.subprocess ──▶ codex exec -C <workspace> -s workspace-write ...
               │                          └─ gpt-image-2 ──▶ <workspace>/images/<file_name>
               └── ctx.jobs (background by default) ──▶ collect with job_output / job_kill
+
+Web UI ──▶ tool.call.toolview (key: image_gen)  (browser half, exports["./client"])
+              └── block.meta (output.presentationMeta) ──▶ poll /codex-canvas RPC ──▶ inline image
 ```
 
 - Processes go through the harness `ctx.subprocess` seam: credential-shaped env vars are scrubbed, termination escalates SIGTERM → grace → SIGKILL across the whole process tree.
 - Generation takes ~1 minute, so the tool defaults to `run_in_background: true` and returns a job id; the model collects the result with the standard `job_output` tool.
 - Output lands in the session workspace under `images/`.
+- **Web preview**: the tool result persists a UI-only artifact descriptor via `output.presentationMeta` (references only — never image bytes, never model-visible). The browser half registers a keyed `image_gen` toolview that shows "generating" while the background job runs, then fetches the image through the plugin's `/codex-canvas` Connection RPC. Every RPC request is re-authorized against the session log (session + callId + artifact descriptor) and every read is confined to that session's `images/` directory with symlink-escape, size, and magic-byte checks. Refreshing the page or restarting DSH replays the image from the persisted descriptor as long as the session and the file exist. CLI/headless profiles keep the text-only behavior — the RPC channel only registers where the connection service exists.
 
 ## Prerequisites (once per machine)
 
@@ -82,6 +86,7 @@ Override the plugin row (`id: codex-canvas`) in the profile's `cordis.patch.yml`
     codexBinary: codex      # executable (PATH name or absolute path)
     timeoutMs: 300000       # foreground generation budget
     graceMs: 5000           # process-tree terminate grace
+    maxImageBytes: 26214400 # preview RPC size cap (25 MiB default)
     env:                    # extra env for the codex child, e.g. proxy
       HTTPS_PROXY: http://127.0.0.1:10809
 ```
@@ -95,6 +100,7 @@ Override the plugin row (`id: codex-canvas`) in the profile's `cordis.patch.yml`
 | Network can't reach OpenAI | Set a proxy via the `env` config (see Configuration) |
 | `failed to spawn code-mode-host` / `the local tool host is missing` | Windows: copy `codex-code-mode-host.exe` (and `codex-windows-sandbox-setup.exe`) from `node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/*/bin/` into the npm bin dir next to `codex.exe`. Git Bash works without this (the sh wrapper resolves vendor paths), but spawned processes hit raw `codex.exe` |
 | Image lands in wrong place | When codex ignores the requested path and drops the PNG into `~/.codex/generated_images/<uuid>/<uuid>.png`, the plugin recovers the freshest image of THIS run and copies it to `<workspace>/images/<file_name>` automatically |
+| Web card shows text only, no image | The browser half did not load: check that the profile composition includes the web layer, that `lib/client.js` shipped with the installed package (`dsh plugin add` from a git source requires the build to succeed), and that the session predates this plugin (old calls carry no artifact descriptor and fall back to the plain row) |
 | Generation takes > 5 min and gets killed | Raise `timeoutMs` |
 
 ## Development
@@ -102,11 +108,14 @@ Override the plugin row (`id: codex-canvas`) in the profile's `cordis.patch.yml`
 ```sh
 git clone https://github.com/mindcarver/dsh-codex-canvas
 cd dsh-codex-canvas
-npm install
-npx tsdown            # build to lib/
+npm install --legacy-peer-deps
+npx tsdown            # build to lib/ (node half + browser client bundle)
 npx tsc --noEmit      # typecheck
-pnpm pack             # release tarball
+npm test              # focused unit tests (meta, artifact safety, rpc, client model)
+npm pack              # release tarball
 ```
+
+`types/*.d.ts` holds compile-time shims for the `@deepseek-ai/*` packages whose published tarballs pull unpublished dependency closures (`dsh-client-ui-tool`, `dsh-client-connection`); everything else typechecks against the published packages. The node half keeps every `@deepseek-ai/*` import external so the profile parent-walk resolves them to the running dsh installation.
 
 To load during development without a profile install, see the harness [first-plugin tutorial](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/index.zh.md) (`--patch` overlay). **Never** run `dsh plugin add` from an un-built source checkout of the harness itself — profile symlinks heal toward the running dsh installation.
 
