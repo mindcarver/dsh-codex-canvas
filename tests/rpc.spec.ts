@@ -2,6 +2,7 @@ import { mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { resolveArtifactPath } from '../src/artifact.ts'
 import { artifactMetaFromValue } from '../src/shared/meta.ts'
 import { createArtifactRpcHandler, type ArtifactJobState, type RpcServices, type SessionEventLike } from '../src/rpc.ts'
 
@@ -61,8 +62,19 @@ function services(fixtures: Record<string, Fixture>): RpcServices {
   }
 }
 
-function makeHandler(svc: RpcServices, states: Record<string, ArtifactJobState> = {}, maxImageBytes = 1024) {
-  const registry = { get: (jobId: string) => states[jobId] }
+function makeHandler(
+  svc: RpcServices,
+  states: Record<string, ArtifactJobState> = {},
+  maxImageBytes = 1024,
+  ownerOverride: { sessionId?: string; outputPath?: string } = {},
+) {
+  const registry = {
+    get: (jobId: string) => states[jobId] === undefined ? undefined : {
+      state: states[jobId],
+      sessionId: ownerOverride.sessionId ?? 's-a',
+      outputPath: ownerOverride.outputPath ?? resolveArtifactPath(cwdA, 'a.png')!,
+    },
+  }
   const handler = createArtifactRpcHandler({ services: svc, registry, maxImageBytes })
   return { handler, call: (endpoint: string, payload: unknown) => handler(endpoint, payload, new AbortController().signal) }
 }
@@ -94,6 +106,21 @@ describe('codex-canvas rpc status', () => {
   it('reports interrupted when neither file nor in-process job memory exists (host restarted mid-run)', async () => {
     const { call } = makeHandler(services({ 's-a': { events: [callEvent('call-1'), resultEvent('call-1', bgMeta)], cwd: cwdA } }))
     expect(await call('status', REQ)).toEqual({ ok: true, value: { status: 'interrupted' } })
+  })
+
+  it('does not let a restarted host\'s same-numbered job answer for an older call (jobId collision)', async () => {
+    const svc = services({ 's-a': { events: [callEvent('call-1'), resultEvent('call-1', bgMeta)], cwd: cwdA } })
+    // Same jobId, but the registry row belongs to a different output path
+    // (another generation in the NEW host process): it must not speak for
+    // this descriptor.
+    const foreignPath = makeHandler(svc, { 'job-1': { status: 'completed' } }, 1024, { outputPath: resolveArtifactPath(cwdA, 'other.png')! })
+    expect(await foreignPath.call('status', REQ)).toEqual({ ok: true, value: { status: 'interrupted' } })
+    // Same jobId owned by a different session: same verdict.
+    const foreignSession = makeHandler(svc, { 'job-1': { status: 'completed' } }, 1024, { sessionId: 's-b' })
+    expect(await foreignSession.call('status', REQ)).toEqual({ ok: true, value: { status: 'interrupted' } })
+    // Matching owner still answers normally.
+    const own = makeHandler(svc, { 'job-1': { status: 'failed', detail: 'x' } })
+    expect(await own.call('status', REQ)).toEqual({ ok: true, value: { status: 'failed', detail: 'x' } })
   })
 
   it('reports unavailable for a foreground ok whose file disappeared', async () => {
