@@ -14,7 +14,7 @@
  * @module dsh-codex-canvas/rpc
  */
 
-import { probeArtifact, readArtifactImage, type ArtifactProbe, type ArtifactReadError } from './artifact.ts'
+import { probeArtifact, readArtifactImage, resolveArtifactPath, type ArtifactProbe, type ArtifactReadError } from './artifact.ts'
 import { artifactMetaFromMeta, artifactRequestFromPayload, RPC_CHANNEL, type ArtifactRequest, type ImageGenArtifactMeta } from './shared/meta.ts'
 
 export { RPC_CHANNEL }
@@ -53,9 +53,21 @@ export interface RpcServices {
   }
 }
 
+/**
+ * One registry row. Job ids restart from 1 in every host process, so the id
+ * alone cannot identify a generation: each row also carries the owning
+ * session and the exact output path, and a lookup only counts when both
+ * match the persisted descriptor being served.
+ */
+export interface ArtifactJobEntry {
+  readonly state: ArtifactJobState
+  readonly sessionId: string
+  readonly outputPath: string
+}
+
 /** Registry the tool body updates as background jobs settle. */
 export interface ArtifactJobRegistryLike {
-  get(jobId: string): ArtifactJobState | undefined
+  get(jobId: string): ArtifactJobEntry | undefined
 }
 
 /** Wire outcome shape shared with the harness RPC envelope. */
@@ -164,11 +176,15 @@ function readErrorReason(error: ArtifactReadError): Reason {
  * @param meta - the persisted descriptor (already authorized).
  * @param registry - in-process background-job memory.
  * @param probe - filesystem presence check inside the session workspace.
+ * @param owner - session id and resolved output path the descriptor names;
+ *   a registry row whose owner differs belongs to another process's
+ *   same-numbered job and must not answer for this call.
  */
 export async function artifactStatusFor(
   meta: ImageGenArtifactMeta,
   registry: ArtifactJobRegistryLike,
   probe: () => Promise<ArtifactProbe>,
+  owner: { readonly sessionId: string; readonly outputPath: string },
 ): Promise<ArtifactStatusValue> {
   const present = await probe()
   if (meta.kind === 'foreground') {
@@ -176,7 +192,10 @@ export async function artifactStatusFor(
     return present.present ? { status: 'completed', bytes: present.bytes } : { status: 'unavailable' }
   }
   if (present.present) return { status: 'completed', bytes: present.bytes }
-  const job = registry.get(meta.jobId)
+  const entry = registry.get(meta.jobId)
+  const job = entry !== undefined && entry.sessionId === owner.sessionId && entry.outputPath === owner.outputPath
+    ? entry.state
+    : undefined
   if (job === undefined) return { status: 'interrupted' }
   switch (job.status) {
     case 'running': return { status: 'running' }
@@ -236,6 +255,10 @@ export function createArtifactRpcHandler(options: ArtifactRpcOptions) {
           authorized.meta,
           options.registry,
           () => probeArtifact(cwd, authorized.meta.fileName),
+          {
+            sessionId: request.sessionId,
+            outputPath: resolveArtifactPath(cwd, authorized.meta.fileName) ?? '',
+          },
         )
         return ok(status)
       }

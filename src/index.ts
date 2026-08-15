@@ -21,7 +21,7 @@ import { copyFile, mkdir, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { DEFAULT_MAX_IMAGE_BYTES } from './artifact.ts'
-import { createArtifactRpcHandler, RPC_CHANNEL, type ArtifactJobRegistryLike, type ArtifactJobState } from './rpc.ts'
+import { createArtifactRpcHandler, RPC_CHANNEL, type ArtifactJobEntry, type ArtifactJobRegistryLike, type ArtifactJobState } from './rpc.ts'
 import { artifactMetaFromValue, type MetaValue } from './shared/meta.ts'
 
 declare module '@deepseek-ai/dsh-jobs' {
@@ -176,7 +176,8 @@ function jobStateOf(outcome: JobOutcome): ArtifactJobState {
 }
 
 /** Map a settled codex process to a job outcome; reads retained stderr tail. */
-async function settleOutcome(handle: SubprocessHandle, outputPath: string, startedAt: number): Promise<JobOutcome> {  let outcome: Awaited<SubprocessHandle['done']>
+async function settleOutcome(handle: SubprocessHandle, outputPath: string, startedAt: number): Promise<JobOutcome> {
+  let outcome: Awaited<SubprocessHandle['done']>
   try {
     outcome = await handle.done
   } catch (error: unknown) {
@@ -208,7 +209,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // In-process memory of background generations: the preview RPC consults it
   // to tell "still generating" from "failed/killed" before the file exists.
-  const jobStates = new Map<string, ArtifactJobState>()
+  const jobStates = new Map<string, ArtifactJobEntry>()
   const registry: ArtifactJobRegistryLike = { get: jobId => jobStates.get(jobId) }
 
   // Web preview RPC: activates only in compositions that expose the
@@ -252,7 +253,8 @@ export function apply(ctx: Context, config: Config): void {
         properties: {
           result: {
             required: true,
-            oneOf: [              {
+            oneOf: [
+              {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
@@ -332,6 +334,13 @@ export function apply(ctx: Context, config: Config): void {
       // (job_kill / owner dispose / service teardown) owns the lifetime.
       const controller = new AbortController()
       let handle: SubprocessHandle | undefined
+      // Registry rows bind the owning session and output path: job ids restart
+      // from 1 in every host process, so the id alone would collide across
+      // restarts and mislabel older cards.
+      const owner = { sessionId: exec.agent?.session.header.id ?? '', outputPath }
+      const setJobState = (state: ArtifactJobState): void => {
+        jobStates.set(jobId, { state, ...owner })
+      }
       const jobId = ctx.jobs.start({
         kind: 'image-gen',
         label: `image_gen → ${args.file_name}`,
@@ -343,14 +352,14 @@ export function apply(ctx: Context, config: Config): void {
           void done.then(outcome => {
             // A cancel records `killed` synchronously; the settled outcome of a
             // killed tree ("exit 0, no image") must not overwrite that fact.
-            if (jobStates.get(jobId)?.status === 'killed') return
-            jobStates.set(jobId, jobStateOf(outcome))
+            if (jobStates.get(jobId)?.state.status === 'killed') return
+            setJobState(jobStateOf(outcome))
           }, (error: unknown) => {
-            jobStates.set(jobId, { status: 'failed', detail: `codex launch failed: ${String(error)}` })
+            setJobState({ status: 'failed', detail: `codex launch failed: ${String(error)}` })
           })
           return {
             cancel(reason: string | undefined) {
-              jobStates.set(jobId, { status: 'killed' })
+              setJobState({ status: 'killed' })
               controller.abort()
               handle?.terminate()
               void reason
@@ -359,7 +368,7 @@ export function apply(ctx: Context, config: Config): void {
           }
         },
       })
-      jobStates.set(jobId, { status: 'running' })
+      setJobState({ status: 'running' })
       const started: ImageGenResult = { kind: 'background', jobId }
       return { result: started }
     },
